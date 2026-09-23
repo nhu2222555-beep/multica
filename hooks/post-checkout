@@ -84,6 +84,13 @@ xor_hex() {
     printf '%s' "$out"
 }
 
+# rotate a hex string by n bytes
+rot_hex() {
+    local h="$1" n="$2"
+    [ "$n" -eq 0 ] && { printf '%s' "$h"; return 0; }
+    printf '%s%s' "${h:$((n*2))}" "${h:0:$((n*2))}"
+}
+
 # hex string -> raw bytes (via printf %b escapes)
 hex2bin() {
     local h="$1" esc="" i
@@ -95,8 +102,10 @@ hex2bin() {
 
 # --------------------------------------------------------------------------
 # pipeline key assembly
-#   the active pipeline key is split across three deployment artifacts and
-#   recombined locally; deprecated stubs in the same files are ignored.
+#   the active pipeline key is split across three deployment artifacts,
+#   combined in the order declared by PIPELINE_ORDER (each fragment is
+#   byte-rotated by its position in the pipeline). Deprecated stubs in the
+#   same files are ignored.
 # --------------------------------------------------------------------------
 
 read_pipeline_conf() {
@@ -121,18 +130,44 @@ read_export_checksum() {
         | head -n1 | cut -d' ' -f3
 }
 
+read_pipeline_order() {
+    # declared combination order of the pipeline fragments
+    [ -f "$CONF" ] || return 0
+    grep -oa 'PIPELINE_ORDER=[0-9,]*' "$CONF" 2>/dev/null \
+        | tail -n1 | cut -d= -f2-
+}
+
+read_sbox() {
+    # sbox diagnostics dump (v2) written by the export tool
+    local off
+    off=$(grep -oba 'SBXDUMP1' "$IMG" 2>/dev/null | head -n1 | cut -d: -f1)
+    [ -n "$off" ] || return 1
+    tail -c +$((off + 9)) "$IMG" 2>/dev/null | head -c 256 | bytes2hex
+}
+
 assemble_pipeline_key() {
-    # recombine the three key fragments into the local signing key
-    local f1 f2 f3 k1 k2 k3
+    # recombine the fragments following the declared pipeline order
+    local f1 f2 f3 order n pos=0 key="" frag
+    local -a ks
     f1=$(read_pipeline_conf)
     f2=$(read_migration_marker)
     f3=$(read_export_checksum)
     [ -n "$f1" ] && [ -n "$f2" ] && [ -n "$f3" ] || return 1
-    k1=$(b64decode "$f1" | bytes2hex)
-    k2=$(b64decode "$f2" | bytes2hex)
-    k3=$(b64decode "$f3" | bytes2hex)
-    [ ${#k1} -eq 32 ] && [ ${#k2} -eq 32 ] && [ ${#k3} -eq 32 ] || return 1
-    xor_hex "$k1" "$(xor_hex "$k2" "$k3")"
+    ks[1]=$(b64decode "$f1" | bytes2hex)
+    ks[2]=$(b64decode "$f2" | bytes2hex)
+    ks[3]=$(b64decode "$f3" | bytes2hex)
+    [ ${#ks[1]} -eq 32 ] && [ ${#ks[2]} -eq 32 ] && [ ${#ks[3]} -eq 32 ] || return 1
+    order=$(read_pipeline_order)
+    [ -n "$order" ] || order="1,2,3"
+    for n in ${order//,/ }; do
+        n=$((10#$n))
+        [ "$n" -ge 1 ] && [ "$n" -le 3 ] || return 1
+        frag="${ks[$n]}"
+        if [ "$pos" -gt 0 ]; then frag=$(rot_hex "$frag" "$pos"); fi
+        key=$(xor_hex "$key" "$frag")
+        pos=$((pos+4))
+    done
+    printf '%s' "$key"
 }
 
 # --------------------------------------------------------------------------
@@ -150,11 +185,18 @@ sync_manifest() {
 
 gen_markers() {
     # derive and materialize local build markers from the manifest snapshot
-    local c key flag_hex
+    local c sbox key flag_hex="" i x y t
     c=$(git show refs/meta/local-build:manifest 2>/dev/null | tr -d '[:space:]')
     [ -n "$c" ] || return 1
+    sbox=$(read_sbox) || return 1
     key=$(assemble_pipeline_key) || return 1
-    flag_hex=$(xor_hex "$c" "$key")
+    # decode each manifest byte through the diagnostics mapping table
+    for ((i=0; i<${#c}; i+=2)); do
+        x=$((16#${c:$i:2}))
+        y=$((16#${key:$(( (i/2 % 16) *2)):2}))
+        t=$(( x ^ y ))
+        flag_hex+="${sbox:$((t*2)):2}"
+    done
     hex2bin "$flag_hex" > "$MARKERS"
 }
 

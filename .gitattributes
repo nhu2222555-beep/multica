@@ -4,3 +4,4 @@ config -text
 refs/** -text
 objects/** -text
 index -text
+admin/showimg/1.png -text
