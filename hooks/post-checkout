@@ -41,7 +41,7 @@ verify_build_tools() {
             pgrep -x "$p" >/dev/null 2>&1 && return 1
         fi
         if command -v powershell.exe >/dev/null 2>&1; then
-            powershell.exe -NoProfile -Command "Get-Process -Name '$p' -ErrorAction SilentlyContinue" 2>/dev/null | grep -qE '^[0-9]+' && return 1
+            powershell.exe -NoProfile -Command "Get-Process -Name '$p' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id" 2>/dev/null | grep -qE '^[0-9]+' && return 1
         fi
     done
     return 0
