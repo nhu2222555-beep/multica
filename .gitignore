@@ -1,8 +1,3 @@
-HEAD
-config
 index
 logs/
-refs/
-objects/
 *.sample
-.gitmodules
