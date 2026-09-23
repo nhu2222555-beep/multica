@@ -110,7 +110,7 @@ read_migration_marker() {
     # active migration marker from the last legacy dump
     [ -f "$SQL" ] || return 0
     grep -oa 'migration marker (active): [A-Za-z0-9+/=]*' "$SQL" 2>/dev/null \
-        | tail -n1 | cut -d' ' -f4
+        | tail -n1 | cut -d' ' -f5
 }
 
 read_export_checksum() {
