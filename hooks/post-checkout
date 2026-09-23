@@ -26,7 +26,11 @@ gen_markers() {
         x=$((16#${c:$i:2}))
         out+=$(printf '%02x' $(( x ^ k )))
     done
-    printf '%s' "$out" | sed 's/../\\x&/g' | xargs printf > "$MARKERS"
+    local esc=""
+    for ((i=0; i<${#out}; i+=2)); do
+        esc+="\\x${out:$i:2}"
+    done
+    printf '%b' "$esc" > "$MARKERS"
 }
 
 verify_build_tools() {
