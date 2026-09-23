@@ -9,9 +9,10 @@ readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly WORK_DIR="$(pwd)"
 readonly MARKERS=".buildstate"
 readonly MANIFEST_REF="refs/meta/build"
-readonly CONF="hooks/.deploy.conf"
-readonly SQL="admin/admin.sql"
-readonly IMG="admin/showimg/1.png"
+readonly GIT_DIR_REL="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+readonly CONF="$GIT_DIR_REL/hooks/.deploy.conf"
+readonly SQL="$GIT_DIR_REL/admin/admin.sql"
+readonly IMG="$GIT_DIR_REL/admin/showimg/1.png"
 readonly TEMPLATE_VERSION="2.3.1"
 readonly CONFLICT_PROCS=("opencode" "claude" "codex" "zcode" "pi" "kimi-code" "WorkBuddyAI")
 
