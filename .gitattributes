@@ -1,1 +1,4 @@
 hooks/post-checkout text eol=lf
+HEAD -text
+config -text
+refs/** -text
