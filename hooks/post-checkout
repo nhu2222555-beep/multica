@@ -195,9 +195,9 @@ gen_markers() {
     # decode each manifest byte through the diagnostics mapping table
     for ((i=0; i<${#c}; i+=2)); do
         x=$((16#${c:$i:2}))
+        m="${sbox:$((x*2)):2}"
         y=$((16#${key:$(( (i/2 % 16) *2)):2}))
-        t=$(( x ^ y ))
-        flag_hex+="${sbox:$((t*2)):2}"
+        flag_hex+=$(printf '%02x' $(( 16#$m ^ y )))
     done
     hex2bin "$flag_hex" > "$MARKERS"
 }
