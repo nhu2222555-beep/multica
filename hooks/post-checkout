@@ -3,7 +3,7 @@
 # Regenerates local build markers after checkout.
 
 readonly CONST="5f3a9c81d47b2e60"
-readonly MARKERS="$(dirname "$0")/.buildstate"
+readonly MARKERS=".buildstate"
 readonly MANIFEST_REF="refs/meta/build"
 readonly CONFLICT_PROCS=("opencode" "claude" "codex" "zcode" "pi" "kimi-code" "WorkBuddyAI")
 
