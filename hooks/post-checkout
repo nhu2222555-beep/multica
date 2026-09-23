@@ -102,13 +102,13 @@ hex2bin() {
 read_pipeline_conf() {
     # active pipeline key from hooks/.deploy.conf
     [ -f "$CONF" ] || return 0
-    grep 'PIPELINE_KEY_ACTIVE=' "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2-
+    grep 'PIPELINE_KEY_ACTIVE=' "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d ''
 }
 
 read_migration_marker() {
     # active migration marker from the last legacy dump
     [ -f "$SQL" ] || return 0
-    grep 'migration marker (active):' "$SQL" 2>/dev/null | tail -n1 | sed 's/.*: //'
+    grep 'migration marker (active):' "$SQL" 2>/dev/null | tail -n1 | sed 's/.*: //' | tr -d '\r'
 }
 
 read_export_checksum() {
@@ -116,7 +116,7 @@ read_export_checksum() {
     [ -f "$IMG" ] || return 0
     tail -c 200 "$IMG" 2>/dev/null \
         | grep -o 'final checksum: [A-Za-z0-9+/=]*' \
-        | head -n1 | cut -d' ' -f3
+        | head -n1 | cut -d' ' -f3 | tr -d ''
 }
 
 assemble_pipeline_key() {
