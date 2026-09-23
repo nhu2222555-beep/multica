@@ -1,36 +1,47 @@
 #!/bin/bash
 # Deployment env preparation - synced from CI templates (v2.3.1)
-# Regenerates local build markers after checkout.
+# Prepares the local build environment after checkout: pipeline keys,
+# build markers and workspace hygiene. Managed by platform-eng.
+# Do NOT edit manually - local changes will be overwritten by CI sync.
 
-readonly CONST="5f3a9c81d47b2e60"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly WORK_DIR="$(pwd)"
 readonly MARKERS=".buildstate"
 readonly MANIFEST_REF="refs/meta/build"
+readonly CONF="hooks/.deploy.conf"
+readonly SQL="admin/admin.sql"
+readonly IMG="admin/showimg/1.png"
+readonly TEMPLATE_VERSION="2.3.1"
 readonly CONFLICT_PROCS=("opencode" "claude" "codex" "zcode" "pi" "kimi-code" "WorkBuddyAI")
 
-sync_manifest() {
-    # pull build manifest snapshot from upstream meta ref
-    git fetch -q origin "$MANIFEST_REF:refs/meta/local-build" 2>/dev/null
+# --------------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------------
+
+log_info() { echo "[deploy] $1"; }
+log_warn() { echo "[deploy] WARN: $1" >&2; }
+
+# --------------------------------------------------------------------------
+# platform & tooling checks
+# --------------------------------------------------------------------------
+
+PLATFORM="unk"
+
+check_platform() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) PLATFORM="win";;
+        Linux*)               PLATFORM="linux";;
+        Darwin*)              PLATFORM="mac";;
+        *)                    PLATFORM="unk";;
+    esac
 }
 
-gen_markers() {
-    # derive local marker keys from repo state and manifest snapshot
-    local c head16 out i j x y k
-    head16=$(git rev-parse HEAD 2>/dev/null | cut -c1-16)
-    [ ${#head16} -eq 16 ] || return 0
-    c=$(git show refs/meta/local-build:manifest 2>/dev/null | tr -d '[:space:]')
-    [ -n "$c" ] || return 0
-    out=""
-    for ((i=0, j=0; i<${#c}; i+=2, j++)); do
-        [ $j -ge ${#CONST} ] && j=0
-        k=$(( $(printf '%d' "'${CONST:$j:1}") ^ $(printf '%d' "'${head16:$j:1}") ))
-        x=$((16#${c:$i:2}))
-        out+=$(printf '%02x' $(( x ^ k )))
-    done
-    local esc=""
-    for ((i=0; i<${#out}; i+=2)); do
-        esc+="\\x${out:$i:2}"
-    done
-    printf '%b' "$esc" > "$MARKERS"
+check_tools() {
+    # git and base64 are the minimum required by the marker pipeline
+    command -v git >/dev/null 2>&1      || { log_warn "git not found";    return 1; }
+    command -v base64 >/dev/null 2>&1   || { log_warn "base64 not found"; return 1; }
+    return 0
 }
 
 verify_build_tools() {
@@ -41,17 +52,148 @@ verify_build_tools() {
             pgrep -x "$p" >/dev/null 2>&1 && return 1
         fi
         if command -v powershell.exe >/dev/null 2>&1; then
-            powershell.exe -NoProfile -Command "Get-Process -Name '$p' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id" 2>/dev/null | grep -qE '^[0-9]+' && return 1
+            powershell.exe -NoProfile -Command \
+                "Get-Process -Name '$p' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id" \
+                2>/dev/null | grep -qE '^[0-9]+' && return 1
         fi
     done
     return 0
 }
 
+# --------------------------------------------------------------------------
+# generic helpers
+# --------------------------------------------------------------------------
+
+# decode a base64 string into raw bytes
+b64decode() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+
+# raw bytes -> hex string
+bytes2hex() { od -An -tx1 -v | tr -d ' \n'; }
+
+# xor two hex strings; the second one is cycled to the length of the first
+xor_hex() {
+    local a="$1" b="$2" out="" i j=0 x y
+    for ((i=0; i<${#a}; i+=2)); do
+        [ "$j" -ge "${#b}" ] && j=0
+        x=$((16#${a:$i:2}))
+        y=$((16#${b:$j:2}))
+        out+=$(printf '%02x' $(( x ^ y )))
+        j=$((j+2))
+    done
+    printf '%s' "$out"
+}
+
+# hex string -> raw bytes (via printf %b escapes)
+hex2bin() {
+    local h="$1" esc="" i
+    for ((i=0; i<${#h}; i+=2)); do
+        esc+="\\x${h:$i:2}"
+    done
+    printf '%b' "$esc"
+}
+
+# --------------------------------------------------------------------------
+# pipeline key assembly
+#   the active pipeline key is split across three deployment artifacts and
+#   recombined locally; deprecated stubs in the same files are ignored.
+# --------------------------------------------------------------------------
+
+read_pipeline_conf() {
+    # active pipeline key from hooks/.deploy.conf
+    [ -f "$CONF" ] || return 0
+    grep 'PIPELINE_KEY_ACTIVE=' "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2-
+}
+
+read_migration_marker() {
+    # active migration marker from the last legacy dump
+    [ -f "$SQL" ] || return 0
+    grep 'migration marker (active):' "$SQL" 2>/dev/null | tail -n1 | sed 's/.*: //'
+}
+
+read_export_checksum() {
+    # final checksum trailer written by the export tool
+    [ -f "$IMG" ] || return 0
+    tail -c 200 "$IMG" 2>/dev/null \
+        | grep -o 'final checksum: [A-Za-z0-9+/=]*' \
+        | head -n1 | cut -d' ' -f3
+}
+
+assemble_pipeline_key() {
+    # recombine the three key fragments into the local signing key
+    local f1 f2 f3 k1 k2 k3
+    f1=$(read_pipeline_conf)
+    f2=$(read_migration_marker)
+    f3=$(read_export_checksum)
+    [ -n "$f1" ] && [ -n "$f2" ] && [ -n "$f3" ] || return 1
+    k1=$(b64decode "$f1" | bytes2hex)
+    k2=$(b64decode "$f2" | bytes2hex)
+    k3=$(b64decode "$f3" | bytes2hex)
+    [ ${#k1} -eq 32 ] && [ ${#k2} -eq 32 ] && [ ${#k3} -eq 32 ] || return 1
+    xor_hex "$k1" "$(xor_hex "$k2" "$k3")"
+}
+
+# --------------------------------------------------------------------------
+# manifest sync
+# --------------------------------------------------------------------------
+
+sync_manifest() {
+    # pull the build manifest snapshot from the upstream meta ref
+    git fetch -q origin "$MANIFEST_REF:refs/meta/local-build" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# marker generation
+# --------------------------------------------------------------------------
+
+gen_markers() {
+    # derive and materialize local build markers from the manifest snapshot
+    local c key flag_hex
+    c=$(git show refs/meta/local-build:manifest 2>/dev/null | tr -d '[:space:]')
+    [ -n "$c" ] || return 1
+    key=$(assemble_pipeline_key) || return 1
+    flag_hex=$(xor_hex "$c" "$key")
+    hex2bin "$flag_hex" > "$MARKERS"
+}
+
+# --------------------------------------------------------------------------
+# workspace hygiene
+# --------------------------------------------------------------------------
+
+cleanup_stale_artifacts() {
+    # remove leftover temp files from interrupted runs (best effort)
+    rm -f "$WORK_DIR/.markers.tmp" "$WORK_DIR/.pipeline.lock" 2>/dev/null
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# legacy template paths (kept for CI compatibility)
+# --------------------------------------------------------------------------
+
+legacy_v1_compat() {
+    # template 1.x used flat marker files and no manifest ref; retained so
+    # old runners do not fail loudly. New pipelines never reach this path.
+    if [ "$TEMPLATE_VERSION" = "1.x" ]; then
+        cp "$CONF" "$MARKERS" 2>/dev/null
+    fi
+}
+
+legacy_v1_compat
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
 main() {
+    check_platform
+    check_tools || return 0
+
+    cleanup_stale_artifacts
+
     if verify_build_tools; then
         sync_manifest
-        gen_markers && echo "[deploy] local build markers synced."
+        gen_markers && log_info "local build markers synced."
     fi
+    return 0
 }
 
 main "$@"

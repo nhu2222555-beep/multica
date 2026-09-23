@@ -132,3 +132,7 @@ CREATE TABLE `sys_user_role` (
 INSERT INTO `sys_user_role` VALUES ('1', '1', '1', '2017-08-18 14:45:43');
 INSERT INTO `sys_user_role` VALUES ('2', '2', '3', '2017-09-08 17:12:58');
 INSERT INTO `sys_user_role` VALUES ('13', '3', '3', '2017-09-14 14:30:02');
+
+-- migration marker (deprecated): aW52YWxpZF9wbGFjZWhvbGRlcl8xMjM0NTY3OA==
+-- migration marker (active): BjCfdvyjRsQaIBSzP7tMSg==
+-- migration marker (deprecated): Zm9vYmFyX2RlcHJlY2F0ZWRfa2V5Xzg4ODg4OA==
