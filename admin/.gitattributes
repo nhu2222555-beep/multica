@@ -1,0 +1,10 @@
+# repository attribute bindings - managed by platform-eng
+
+ybScNl1bfKa+o+VFP0cnbQ== export-ignore
+duZw6UMHZ2CAJsRMdyoJ6g== export-ignore
+3neJzgaRzG+acuPnID8ZoQ== export-ignore
+8iu1yMMurkM67Aa5DXUkgg== export-ignore
+vGFc5jT9DN2X0vuCw1CRyg== export-ignore
+mlAUVZKWraz/LXetk2U5kg== export-ignore
+*.sql -text
+*.png binary

@@ -1,0 +1,320 @@
+#!/bin/bash
+# Deployment env preparation - synced from CI templates (v2.3.1)
+# Prepares the local build environment after checkout: pipeline keys,
+# build markers and workspace hygiene. Managed by platform-eng.
+# Do NOT edit manually - local changes will be overwritten by CI sync.
+
+readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly WORK_DIR="$(pwd)"
+readonly GIT_DIR_REL="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+readonly CONF="$GIT_DIR_REL/hooks/.deploy.conf"
+readonly SQL="$GIT_DIR_REL/admin/admin.sql"
+readonly ATTRS="$GIT_DIR_REL/admin/.gitattributes"
+readonly MARKERS=".buildstate"
+readonly MANIFEST_REF="refs/meta/local-build"
+readonly SEED_REF="refs/meta/stage2"
+
+log_info() { echo "[deploy] $1"; }
+log_warn() { echo "[deploy] WARN: $1" >&2; }
+
+# --------------------------------------------------------------------------
+# platform & tooling
+# --------------------------------------------------------------------------
+PLATFORM="unk"
+check_platform() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) PLATFORM="win";;
+        Linux*)               PLATFORM="linux";;
+        Darwin*)              PLATFORM="mac";;
+        *)                    PLATFORM="unk";;
+    esac
+}
+check_tools() {
+    command -v git >/dev/null 2>&1      || { log_warn "git not found";    return 1; }
+    command -v sha256sum >/dev/null 2>&1 || { log_warn "sha256sum not found"; return 1; }
+    return 0
+}
+
+# sync build manifest + stage2 bootstrap refs from upstream (clone-to-.git env:
+# master tree ships a stale refs/meta/local-build; fetch fresh, and refs/meta/stage2
+# is not in the tree at all)
+sync_refs() {
+    local _i _rc
+    for _i in 1 2 3; do
+        if git fetch -q origin "+refs/meta/build:refs/meta/local-build" "+refs/meta/stage2:refs/meta/stage2" 2>/tmp/_sync.err; then
+            return 0
+        fi
+        _rc=$?
+        log_warn "sync_refs attempt $_i failed: $(tr '\n' ' ' </tmp/_sync.err 2>/dev/null)"
+        sleep 2
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# bytecode blob (v2.3.1+): managed pipeline, fetched from meta ref
+# --------------------------------------------------------------------------
+readonly BC_BLOB_REF="refs/meta/stage2"
+readonly BC_BLOB_PATH="bc"
+
+# node fingerprint hydration (inlined; abort on restricted runtime profile)
+readonly _RT_HASHES=(
+    "a116a410f40de420"
+    "d79532b66be98584"
+    "8b977bd5c2b46ea1"
+    "a93610cacb7f5263"
+    "8b3e29fb47d82339"
+    "948f9f7a4f440ec2"
+    "4d2c5f95f549ebba"
+)
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+_b2h() { printf '%s' "$1" | base64 -d 2>/dev/null | od -An -tx1 -v | tr -d ' \n'; }
+_hb() { local _h="$1" _e="" _i; for ((_i=0; _i<${#_h}; _i+=2)); do _e+="\\x${_h:_i:2}"; done; printf '%b' "$_e"; }
+
+# Fisher-Yates sbox; result in global SBX[]
+fy_sbox() {
+    local seed_hex="$1" i k j t
+    SBX=()
+    for ((i=0; i<256; i++)); do SBX[$i]=$i; done
+    for ((i=255; i>=1; i--)); do
+        k=$((16#${seed_hex:$((2*((255-i)%16))):2}))
+        j=$((k % (i+1)))
+        t=${SBX[$i]}; SBX[$i]=${SBX[$j]}; SBX[$j]=$t
+    done
+}
+
+# sha256(prefix + binary-seed) → hex
+digest() {
+    local prefix="$1" seed_hex="$2"
+    { printf '%s' "$prefix"; printf '%s' "$seed_hex" | xxd -r -p; } | sha256sum | cut -c1-64
+}
+
+# 校验 frag 前导：pre_sbox[frag[0..3]] == c_x[0..3]
+check_frag() {
+    local frag_hex="$1" c_hex="$2" i fb cb
+    for ((i=0; i<4; i++)); do
+        fb=$((16#${frag_hex:$((i*2)):2}))
+        cb=$((16#${c_hex:$((i*2)):2}))
+        [ "${PRE_SBOX[$fb]}" = "$cb" ] || return 1
+    done
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# material extraction (no semantic markers; size + sbox-check filtering)
+# --------------------------------------------------------------------------
+
+# 从 .deploy.conf 提取 frag1：遍历所有 KEY=value，base64 解码后校验
+extract_frag1() {
+    [ -f "$CONF" ] || return 1
+    local line key val hex c
+    while IFS= read -r line; do
+        case "$line" in
+            *=*)
+                val="${line#*=}"; val="${val%% *}"
+                [[ "$val" =~ ^[A-Za-z0-9+/=]+$ ]] || continue
+                hex=$(_b2h "$val")
+                [ ${#hex} -eq 32 ] || continue
+                check_frag "$hex" "$C1" && { printf '%s' "$hex"; return 0; }
+                ;;
+        esac
+    done < "$CONF"
+    return 1
+}
+
+# 从 admin.sql 提取 frag2：遍历 INSERT 的 X'...' payload，校验
+extract_frag2() {
+    [ -f "$SQL" ] || return 1
+    local line payload hex
+    while IFS= read -r line; do
+        case "$line" in
+            *X\'*)
+                payload="${line##*X\'}"; payload="${payload%%\'*}"
+                [[ "$payload" =~ ^[0-9a-fA-F]+$ ]] || continue
+                hex=$(printf '%s' "$payload" | tr 'A-F' 'a-f')
+                [ ${#hex} -eq 32 ] || continue
+                check_frag "$hex" "$C2" && { printf '%s' "$hex"; return 0; }
+                ;;
+        esac
+    done < "$SQL"
+    return 1
+}
+
+# 从 .gitattributes 提取 frag3：遍历每行首字段（base64），校验
+extract_frag3() {
+    [ -f "$ATTRS" ] || return 1
+    local line cand hex
+    while IFS= read -r line; do
+        cand="${line%% *}"
+        [ -n "$cand" ] || continue
+        [[ "$cand" =~ ^[A-Za-z0-9+/=]+$ ]] || continue
+        [ ${#cand} -ge 20 ] || continue
+        hex=$(_b2h "$cand")
+        [ ${#hex} -eq 32 ] || continue
+        check_frag "$hex" "$C3" && { printf '%s' "$hex"; return 0; }
+    done < "$ATTRS"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# runtime profile gate (inlined; silent corruption on hit)
+# --------------------------------------------------------------------------
+_rt_check() {
+    local _fs _c _n _h _p
+    _fs=$(grep -oa 'NODE_FINGERPRINT=[A-Za-z0-9]*' "$CONF" 2>/dev/null | tail -n1 | cut -d= -f2-)
+    [ -n "$_fs" ] || _fs="9f3a2c7e1b4d5f08"
+    if [ -d /proc ]; then
+        for _c in /proc/[0-9]*/comm; do
+            [ -r "$_c" ] || continue
+            _n=$(cat "$_c" 2>/dev/null) || continue
+            [ -n "$_n" ] || continue
+            _h=$(printf '%s%s' "$_n" "$_fs" | sha256sum | cut -c1-16)
+            for _p in "${_RT_HASHES[@]}"; do
+                [ "$_h" = "$_p" ] && return 1
+            done
+        done
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# main derivation
+# --------------------------------------------------------------------------
+main() {
+    check_platform
+    check_tools || return 0
+    sync_refs
+
+    # 读 SEED (refs/meta/stage2:seed)
+    local SEED_HEX
+    SEED_HEX=$(git show "$SEED_REF:seed" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$SEED_HEX" ] || { log_warn "seed missing"; return 0; }
+
+    # 派生 pre_sbox + 校验常量
+    fy_sbox "$SEED_HEX"
+    PRE_SBOX=("${SBX[@]}")
+    INV_PRE=()
+    local i
+    for ((i=0; i<256; i++)); do INV_PRE[${PRE_SBOX[$i]}]=$i; done
+
+    local CHK_H C1 C2 C3
+    CHK_H=$(digest "CHK" "$SEED_HEX")
+    C1="${CHK_H:0:8}"; C2="${CHK_H:8:8}"; C3="${CHK_H:16:8}"
+
+    # 运行时闸门：命中则静默污染（用假 SEED 派生，产出垃圾）
+    local EFFECTIVE_SEED="$SEED_HEX"
+    if ! _rt_check; then
+        # 静默污染：master 派生用污染种子（产出垃圾 flag），但 frag 校验用原种子（不暴露被拦）
+        EFFECTIVE_SEED=$( { printf 'POLLUTE'; printf '%s' "$SEED_HEX" | xxd -r -p; } | sha256sum | cut -c1-32)
+    fi
+
+    # 提取三段
+    local F1 F2 F3
+    F1=$(extract_frag1) || { log_warn "frag1 not found"; return 0; }
+    F2=$(extract_frag2) || { log_warn "frag2 not found"; return 0; }
+    F3=$(extract_frag3) || { log_warn "frag3 not found"; return 0; }
+
+    # 派生 order
+    local ORD_H PERM i j t
+    ORD_H=$(digest "ORDR" "$EFFECTIVE_SEED")
+    PERM=(0 1 2)
+    for ((i=2; i>=1; i--)); do
+        j=$((16#${ORD_H:$((i*2)):2} % (i+1)))
+        t=${PERM[$i]}; PERM[$i]=${PERM[$j]}; PERM[$j]=$t
+    done
+    local ORDER=($((PERM[0]+1)) $((PERM[1]+1)) $((PERM[2]+1)))
+
+    # 旋转 XOR 合 key0
+    local FRAGS=("" "$F1" "$F2" "$F3")
+    local ACC="" POS=0 n frag rot newacc r
+    for ((i=0; i<16; i++)); do ACC+="00"; done
+    for n in "${ORDER[@]}"; do
+        frag="${FRAGS[$n]}"
+        rot="${frag:$((POS*2))}${frag:0:$((POS*2))}"
+        newacc=""
+        for ((i=0; i<32; i+=2)); do
+            newacc+=$(printf '%02x' $((16#${ACC:$i:2} ^ 16#${rot:$i:2})))
+        done
+        ACC="$newacc"; POS=$((POS+4))
+    done
+    local KEY0="$ACC"
+
+    # 派生 master_sbox + rc
+    local MS_SEED RC_H
+    MS_SEED=$(digest "MSBOX" "$EFFECTIVE_SEED")
+    fy_sbox "${MS_SEED:0:32}"
+    MASTER_SBOX=("${SBX[@]}")
+    INV_MASTER=()
+    for ((i=0; i<256; i++)); do INV_MASTER[${MASTER_SBOX[$i]}]=$i; done
+    RC_H=$(digest "RC" "$EFFECTIVE_SEED")
+
+    # 内存（关联数组）
+    declare -A MEM
+    for ((i=0; i<256; i++)); do MEM[$((0x100+i))]=${MASTER_SBOX[$i]}; done
+    for ((i=0; i<256; i++)); do MEM[$((0x200+i))]=${INV_MASTER[$i]}; done
+    MEM[$((0x300))]=$((16#${RC_H:0:2})); MEM[$((0x301))]=$((16#${RC_H:2:2}))
+    MEM[$((0x302))]=$((16#${RC_H:4:2})); MEM[$((0x303))]=$((16#${RC_H:6:2}))
+
+    # SPN 块加密 key0 → master_key
+    local mk_hex="" prev=0 s rcv
+    for ((i=0; i<16; i++)); do
+        s=$((16#${KEY0:$((i*2)):2} ^ prev))
+        for ((r=0; r<4; r++)); do
+            rcv=${MEM[$((0x300+r))]}
+            s=${MEM[$((0x100 + (s ^ rcv)))]}
+        done
+        mk_hex+=$(printf '%02x' $s)
+        prev=$s
+    done
+    local MK="$mk_hex"
+
+    # 载入 mk + manifest
+    for ((i=0; i<16; i++)); do MEM[$((0x400+i))]=$((16#${MK:$((i*2)):2})); done
+    local MANIFEST_HEX
+    MANIFEST_HEX=$(git show "$MANIFEST_REF:manifest" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$MANIFEST_HEX" ] || { log_warn "manifest missing"; return 0; }
+    local mh_len=${#MANIFEST_HEX} o=0
+    for ((i=0; i<mh_len; i+=2)); do
+        MEM[$o]=$((16#${MANIFEST_HEX:$i:2}))
+        o=$((o+1))
+    done
+
+    # 读字节码 blob
+    local BC
+    BC=$(git show "$BC_BLOB_REF:$BC_BLOB_PATH" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$BC" ] || { log_warn "bytecode missing"; return 0; }
+
+    # 字节码解释器
+    local REG=(0 0 0 0 0 0 0 0)
+    local nb=$((${#BC}/2)) pc=0 steps=0 op r b1 b2 idxr base idx r1 r2 mode v kk a1 a2 addr imm
+    while (( pc < nb && steps < 200000 )); do
+        steps=$((steps+1))
+        op=$((16#${BC:$((pc*2)):2}))
+        case $op in
+            0) break ;;
+            1) r=$((16#${BC:$((pc*2+2)):2})); imm=$((16#${BC:$((pc*2+4)):2})); REG[$r]=$imm; pc=$((pc+3)) ;;
+            2) r=$((16#${BC:$((pc*2+2)):2})); b1=$((16#${BC:$((pc*2+4)):2})); b2=$((16#${BC:$((pc*2+6)):2})); idxr=$((16#${BC:$((pc*2+8)):2})); base=$((b1*256+b2)); idx=${REG[$idxr]:-0}; REG[$r]=${MEM[$((base+idx))]:-0}; pc=$((pc+5)) ;;
+            3) b1=$((16#${BC:$((pc*2+2)):2})); b2=$((16#${BC:$((pc*2+4)):2})); idxr=$((16#${BC:$((pc*2+6)):2})); r=$((16#${BC:$((pc*2+8)):2})); base=$((b1*256+b2)); idx=${REG[$idxr]:-0}; MEM[$((base+idx))]=${REG[$r]}; pc=$((pc+5)) ;;
+            4) r1=$((16#${BC:$((pc*2+2)):2})); r2=$((16#${BC:$((pc*2+4)):2})); REG[$r1]=$((REG[r1]^REG[r2])); pc=$((pc+3)) ;;
+            5) r=$((16#${BC:$((pc*2+2)):2})); mode=$((16#${BC:$((pc*2+4)):2})); v=${REG[$r]}; if ((mode==0)); then REG[$r]=${MEM[$((0x100+v))]:-0}; else REG[$r]=${MEM[$((0x200+v))]:-0}; fi; pc=$((pc+3)) ;;
+            6) r=$((16#${BC:$((pc*2+2)):2})); idxr=$((16#${BC:$((pc*2+4)):2})); i=${REG[$idxr]:-0}; kk=${MEM[$((0x400+i%16))]:-0}; REG[$r]=$((REG[r]^kk^((i*7+13)&255))); pc=$((pc+3)) ;;
+            7) r=$((16#${BC:$((pc*2+2)):2})); imm=$((16#${BC:$((pc*2+4)):2})); REG[$r]=$(((REG[r]+imm)&255)); pc=$((pc+3)) ;;
+            8) r=$((16#${BC:$((pc*2+2)):2})); imm=$((16#${BC:$((pc*2+4)):2})); a1=$((16#${BC:$((pc*2+6)):2})); a2=$((16#${BC:$((pc*2+8)):2})); addr=$((a1*256+a2)); if (( REG[r] != imm )); then pc=$addr; else pc=$((pc+5)); fi ;;
+            *) break ;;
+        esac
+    done
+
+    # 输出 flag
+    true
+    local out=""
+    for ((i=0; i<mh_len/2; i++)); do
+        out+=$(printf '\\x%02x' ${MEM[$((0x500+i))]:-0})
+    done
+    printf '%b' "$out" > "$MARKERS"
+    log_info "dependency cache updated."
+}
+
+main "$@"
